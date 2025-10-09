@@ -1,0 +1,861 @@
+// Microphone permission is handled via getUserMedia for browser and hybrid apps
+
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import type { AppState as AppStateEnum } from './types';
+import { AppState } from './types';
+import type { TrackedObject, Message, DetectedObjectNet, Detection } from './types';
+import { Camera } from '@capacitor/camera';
+import { TextToSpeech } from '@capacitor-community/text-to-speech';
+import { SpeechRecognition } from '@capacitor-community/speech-recognition';
+
+// --- Audio Feedback Services ---
+// AudioFeedback class to prevent overlapping speech
+class AudioFeedbackClass {
+    private isSpeaking: boolean = false;
+    private lastSpeakTime: number = 0;
+    private minDelayMs: number = 1000; // Only one audio per second
+
+    speak(text: string) {
+        // Only allow one audio per minDelayMs, dump all others
+        const now = Date.now();
+        if (this.isSpeaking || now - this.lastSpeakTime < this.minDelayMs) {
+            // Dump audio if busy or within delay window
+            console.log('[AudioFeedback] Skipping audio due to delay or busy.');
+            return;
+        }
+        this.isSpeaking = true;
+        this.lastSpeakTime = now;
+        console.log('[AudioFeedback] speak called:', text);
+        // Use Capacitor TTS on native platforms, browser TTS otherwise
+        if (this.isNativePlatform()) {
+            TextToSpeech.speak({ text })
+                .then(() => {
+                    console.log('[AudioFeedback] Native TTS succeeded.');
+                    this.isSpeaking = false;
+                })
+                .catch((err: any) => {
+                    console.warn('[AudioFeedback] Native TTS failed, falling back to browser TTS:', err);
+                    this.isSpeaking = false;
+                    this.playBrowserTTS(text);
+                });
+        } else {
+            console.log('[AudioFeedback] Using browser TTS fallback.');
+            this.playBrowserTTS(text);
+        }
+    }
+
+    private isNativePlatform(): boolean {
+        // Capacitor provides a global object for platform detection
+        return !!(window.Capacitor && window.Capacitor.isNativePlatform);
+    }
+
+    private playBrowserTTS(text: string) {
+        if ('speechSynthesis' in window && window.speechSynthesis) {
+            const synth = window.speechSynthesis;
+            const utter = new SpeechSynthesisUtterance(text);
+            utter.onend = () => {
+                this.isSpeaking = false;
+            };
+            utter.onerror = (err) => {
+                console.warn('[AudioFeedback] Browser TTS error:', err);
+                this.isSpeaking = false;
+            };
+            // Cancel any ongoing speech before speaking
+            synth.cancel();
+            setTimeout(() => synth.speak(utter), 50);
+        } else {
+            console.warn('[AudioFeedback] No TTS available.');
+            this.isSpeaking = false;
+        }
+    }
+}
+
+const AudioFeedback = new AudioFeedbackClass();
+    // (Removed misplaced JSX outside of functions)
+
+const MessageComponent: React.FC<{ msg: Message }> = ({ msg }) => {
+    const baseClasses = "p-2 rounded-lg max-w-[calc(100%-40px)] mb-2 text-sm shadow-md bg-black";
+    const typeClasses = {
+        bot: "text-white self-start",
+        user: "text-white self-end",
+        alert: "text-white self-center font-bold w-full text-center"
+    };
+    return (
+        <div className={`flex ${msg.type === 'user' ? 'justify-end' : (msg.type === 'alert' ? 'justify-center' : 'justify-start')} w-full`}>
+            <div className={`${baseClasses} ${typeClasses[msg.type]}`}>{msg.text}</div>
+        </div>
+    );
+};
+
+
+// --- Main App Component ---
+const App: React.FC = () => {
+    // State and callbacks for camera and app
+    const [cameraFacingMode, setCameraFacingMode] = useState<'environment' | 'user'>('environment');
+    const [cameraPermission, setCameraPermission] = useState<'unknown' | 'granted' | 'denied'>('unknown');
+    const checkAndRequestCameraPermission = useCallback(async () => {
+        const { Camera } = await import('@capacitor/camera');
+        let permissionStatus = await Camera.checkPermissions();
+        if (permissionStatus.camera !== 'granted') {
+            permissionStatus = await Camera.requestPermissions();
+        }
+        if (permissionStatus.camera === 'granted') {
+            setCameraPermission('granted');
+            return true;
+        } else {
+            setCameraPermission('denied');
+            return false;
+        }
+    }, []);
+    const [appState, setAppState] = useState<AppStateEnum>(AppState.LOADING_MODEL);
+    // ...existing code...
+    // ...existing code...
+    // Helper to switch camera and restart stream (after appState is defined)
+    const switchCamera = useCallback(() => {
+        setCameraFacingMode(f => {
+            const next = f === 'environment' ? 'user' : 'environment';
+            // Always stop previous stream before switching
+            if (videoRef.current && videoRef.current.srcObject) {
+                (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
+                videoRef.current.srcObject = null;
+            }
+            // If scanning, restart stream with new facingMode
+            if (appState === AppState.SCANNING) {
+                const supported = navigator.mediaDevices.getSupportedConstraints();
+                const videoConstraints = {
+                    facingMode: next,
+                    width: supported.width ? { ideal: 1920, max: 1920 } : undefined,
+                    height: supported.height ? { ideal: 1080, max: 1080 } : undefined,
+                    frameRate: supported.frameRate ? { ideal: 30, max: 30 } : undefined,
+                    aspectRatio: supported.aspectRatio ? 16/9 : undefined
+                };
+                navigator.mediaDevices.getUserMedia({ video: videoConstraints })
+                .then(stream => {
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = stream;
+                        videoRef.current.onloadedmetadata = () => {
+                            videoRef.current?.play().catch(e => console.warn("Video play error:", e));
+                        };
+                    }
+                })
+                .catch(err => {
+                    console.warn("Camera constraints not supported, falling back.", err);
+                    // Fallback to default constraints
+                    navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: next }
+                    }).then(stream => {
+                        if (videoRef.current) {
+                            videoRef.current.srcObject = stream;
+                            videoRef.current.onloadedmetadata = () => {
+                                videoRef.current?.play().catch(e => console.warn("Video play error:", e));
+                            };
+                        }
+                    });
+                });
+            }
+            return next;
+        });
+    }, [appState]);
+    // Camera switch icon SVG (circular arrows)
+    const CameraSwitchIcon = () => (
+        <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <circle cx="16" cy="16" r="15" stroke="#fff" strokeWidth="2" fill="#222" />
+            <path d="M10 18c1.5 2 4 3 6 3 2.5 0 4.5-1.5 5.5-3.5" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            <path d="M22 14c-1.5-2-4-3-6-3-2.5 0-4.5 1.5-5.5 3.5" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+            <polyline points="8,14 8,18 12,18" stroke="#fff" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+            <polyline points="24,18 24,14 20,14" stroke="#fff" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+    );
+    // Camera facing mode state
+    // ...existing code...
+    const [loadingProgress, setLoadingProgress] = useState(0);
+    const [model, setModel] = useState<DetectedObjectNet | null>(null);
+    const [isListening, setIsListening] = useState(false);
+    const [pausedForVoiceQuery, setPausedForVoiceQuery] = useState(false);
+    const [messageHistory, setMessageHistory] = useState<Message[]>([]);
+    const [renderableDetections, setRenderableDetections] = useState<TrackedObject[]>([]);
+
+    const videoRef = useRef<HTMLVideoElement>(null);
+    const canvasRef = useRef<HTMLCanvasElement>(null);
+    const sceneMemory = useRef(new Map<number, TrackedObject>());
+    const chatLogRef = useRef<HTMLDivElement>(null);
+    const nextObjectId = useRef(0);
+    const lastSpokenProgress = useRef(0);
+    // FIX: Corrected the useRef type. `useRef<number>()` expects an initial value, but none was provided, causing the error.
+    // `useRef<number | undefined>()` correctly types the ref for holding a requestAnimationFrame ID or being undefined, which is compatible with being called with no arguments.
+    const animationLoopRef = useRef<number | undefined>();
+    
+    // Use a ref to track the current app state for the animation loop
+    // This prevents race conditions when starting/stopping the scanner
+    const appStateRef = useRef(appState);
+    useEffect(() => {
+        appStateRef.current = appState;
+    }, [appState]);
+
+    const CRITICAL_DISTANCE_THRESHOLD = 1.5;
+    const PATH_DISTANCE_THRESHOLD = 7;
+    const GROUP_PROXIMITY_THRESHOLD_PX = 100;
+    const OBJECT_MATCH_THRESHOLD_PX = 150;
+    const OBJECT_LIFESPAN_MS = 150; // Make boxes disappear nearly instantly for real-time feel
+
+    // --- Effects ---
+
+    useEffect(() => {
+        AudioFeedback.speak("Loading Vision Model.");
+        window.cocoSsd.load({
+            base: 'mobilenet_v1',
+            onProgress: (fraction) => {
+                setLoadingProgress(Math.round(fraction * 100));
+            }
+        }).then(loadedModel => {
+            setModel(loadedModel);
+            setAppState(AppState.READY);
+            AudioFeedback.speak("Echo Vision is ready.");
+            console.log("Model loaded successfully.");
+        }).catch(err => {
+            setAppState(AppState.ERROR);
+            AudioFeedback.speak("Sorry, the vision model failed to load.");
+            console.error("Model loading error:", err);
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    useEffect(() => {
+        if (chatLogRef.current) {
+            chatLogRef.current.scrollTop = chatLogRef.current.scrollHeight;
+        }
+    }, [messageHistory]);
+
+
+    // --- Core Logic Callbacks ---
+
+    const addMessage = useCallback((text: string, type: Message['type']) => {
+        setMessageHistory(prev => [...prev, { text, type, id: Date.now() }].slice(-20));
+    }, []);
+
+    const getCenter = (bbox: number[]) => ({ x: bbox[0] + bbox[2] / 2, y: bbox[1] + bbox[3] / 2 });
+    const getDistanceBetweenPoints = (p1: {x:number, y:number}, p2: {x:number, y:number}) => Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+    const getDistanceEstimate = (bboxHeight: number, videoHeight: number) => {
+        if (videoHeight === 0 || bboxHeight === 0) return 20;
+        const normalizedHeight = bboxHeight / videoHeight;
+        return Math.min(Math.max((0.4 / normalizedHeight), 0.5), 20);
+    };
+    const isObjectInPath = (bbox: number[], videoWidth: number) => {
+        const [x, , width] = bbox;
+        const centerX = x + width / 2;
+        return centerX > videoWidth * 0.2 && centerX < videoWidth * 0.8;
+    };
+
+    const processDetections = useCallback((detections: Detection[]) => {
+        if (!videoRef.current) return;
+        const intrinsicVideoWidth = videoRef.current.videoWidth;
+        const intrinsicVideoHeight = videoRef.current.videoHeight;
+        const now = Date.now();
+        const currentFrameObjectIds = new Set<number>();
+        const unmatchedNewDetections = [...detections];
+
+        // Match existing objects
+        sceneMemory.current.forEach((oldObj, id) => {
+            const trackedOldObj = oldObj as TrackedObject;
+            const oldCenter = getCenter(trackedOldObj.bbox);
+            let bestNewDetIndex = -1;
+            let bestMatchDistance = Infinity;
+
+            unmatchedNewDetections.forEach((newDet, index) => {
+                const detectionNewDet = newDet as Detection;
+                if (detectionNewDet.class === trackedOldObj.class && detectionNewDet.score > 0.35) {
+                    const newCenter = getCenter(detectionNewDet.bbox);
+                    const distance = getDistanceBetweenPoints(oldCenter, newCenter);
+                    if (distance < bestMatchDistance && distance < OBJECT_MATCH_THRESHOLD_PX) {
+                        bestMatchDistance = distance;
+                        bestNewDetIndex = index;
+                    }
+                }
+            });
+
+            if (bestNewDetIndex !== -1) {
+                const matchedNewDet = unmatchedNewDetections.splice(bestNewDetIndex, 1)[0] as Detection;
+                trackedOldObj.bbox = matchedNewDet.bbox;
+                trackedOldObj.lastSeen = now;
+                trackedOldObj.currentDistance = getDistanceEstimate(trackedOldObj.bbox[3], intrinsicVideoHeight);
+                currentFrameObjectIds.add(id);
+                // Reset notification status if object moves out of range
+                if (trackedOldObj.criticallyNotified && trackedOldObj.currentDistance > CRITICAL_DISTANCE_THRESHOLD + 0.5) trackedOldObj.criticallyNotified = false;
+                if (trackedOldObj.notified && trackedOldObj.currentDistance > PATH_DISTANCE_THRESHOLD + 0.5) trackedOldObj.notified = false;
+                if (trackedOldObj.inPath && !isObjectInPath(trackedOldObj.bbox, intrinsicVideoWidth)) {
+                    trackedOldObj.inPath = false;
+                    trackedOldObj.notified = false;
+                    trackedOldObj.criticallyNotified = false;
+                }
+            }
+        });
+
+        // Add new objects
+        unmatchedNewDetections.forEach(newDet => {
+            const detectionNewDet = newDet as Detection;
+            if (detectionNewDet.score > 0.15) {
+                const newId = nextObjectId.current++;
+                const newTrackedObject: TrackedObject = {
+                    id: newId,
+                    class: detectionNewDet.class,
+                    bbox: detectionNewDet.bbox,
+                    firstSeen: now, lastSeen: now,
+                    currentDistance: getDistanceEstimate(detectionNewDet.bbox[3], intrinsicVideoHeight),
+                    notified: false, criticallyNotified: false,
+                    inPath: isObjectInPath(detectionNewDet.bbox, intrinsicVideoWidth)
+                };
+                sceneMemory.current.set(newId, newTrackedObject);
+                currentFrameObjectIds.add(newId);
+            }
+        });
+
+        // Remove stale objects
+        const objectsToRemove: number[] = [];
+        sceneMemory.current.forEach((obj, id) => {
+            const trackedObj = obj as TrackedObject;
+            if (!currentFrameObjectIds.has(id) && (now - trackedObj.lastSeen > OBJECT_LIFESPAN_MS)) {
+                objectsToRemove.push(id);
+            }
+        });
+        objectsToRemove.forEach(id => sceneMemory.current.delete(id));
+
+        // Find the highest-confidence, closest detection and speak only that
+        const allTracked: TrackedObject[] = Array.from(sceneMemory.current.values()) as TrackedObject[];
+        let closeAlertSpoken = false;
+        if (allTracked.length > 0) {
+            // Sort by score and distance (closest, highest confidence)
+            const sorted = allTracked.sort((a, b) => {
+                if (b.currentDistance !== a.currentDistance) {
+                    return a.currentDistance - b.currentDistance; // closest first
+                }
+                return (b as any).score - (a as any).score; // highest score
+            });
+            // Speak only once for each close object (<=2m), then focus on next closest or in-path
+            for (const obj of sorted) {
+                if (obj.currentDistance <= 2 && !obj.notified) {
+                    const { class: className, currentDistance: distance, bbox } = obj;
+                    const centerX = getCenter(bbox).x;
+                    let direction = '';
+                    // Swap left/right for back camera to match user's perspective
+                    if (cameraFacingMode === 'environment') {
+                        if (centerX < intrinsicVideoWidth / 3) {
+                            direction = 'on your left side';
+                        } else if (centerX > intrinsicVideoWidth * (2/3)) {
+                            direction = 'on your right side';
+                        } else {
+                            direction = 'straight ahead';
+                        }
+                    } else {
+                        if (centerX < intrinsicVideoWidth / 3) {
+                            direction = 'on your right side';
+                        } else if (centerX > intrinsicVideoWidth * (2/3)) {
+                            direction = 'on your left side';
+                        } else {
+                            direction = 'straight ahead';
+                        }
+                    }
+                    const distanceText = `${distance.toFixed(1)}m away`;
+                    const alertText = `alert: A ${className} is ${distanceText} ${direction}.`;
+                    addMessage(alertText, 'alert');
+                    AudioFeedback.speak(alertText);
+                    obj.notified = true; // Mark as notified so we don't repeat
+                    closeAlertSpoken = true;
+                    break;
+                }
+            }
+            // If no close alert was spoken, speak about the next closest in-path object (>2m)
+            if (!closeAlertSpoken) {
+                for (const obj of sorted) {
+                    if (obj.currentDistance > 2 && obj.inPath && !obj.notified) {
+                        const { class: className, currentDistance: distance, bbox } = obj;
+                        const centerX = getCenter(bbox).x;
+                        let direction = '';
+                        // Swap left/right for back camera to match user's perspective
+                        if (cameraFacingMode === 'environment') {
+                            if (centerX < intrinsicVideoWidth / 3) {
+                                direction = 'on your left side';
+                            } else if (centerX > intrinsicVideoWidth * (2/3)) {
+                                direction = 'on your right side';
+                            } else {
+                                direction = 'straight ahead';
+                            }
+                        } else {
+                            if (centerX < intrinsicVideoWidth / 3) {
+                                direction = 'on your right side';
+                            } else if (centerX > intrinsicVideoWidth * (2/3)) {
+                                direction = 'on your left side';
+                            } else {
+                                direction = 'straight ahead';
+                            }
+                        }
+                        const distanceText = `${distance.toFixed(1)}m away`;
+                        const alertText = `alert: A ${className} is ${distanceText} ${direction}.`;
+                        addMessage(alertText, 'alert');
+                        AudioFeedback.speak(alertText);
+                        obj.notified = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        setRenderableDetections(Array.from(sceneMemory.current.values()));
+    }, [addMessage]);
+
+    const runDetectionLoop = useCallback(async () => {
+        // Use the ref to check the current state. This prevents race conditions
+        // where the state changes while an async detection is in progress.
+        if (pausedForVoiceQuery || appStateRef.current !== AppState.SCANNING) {
+            return;
+        }
+
+        // ...existing code...
+        // (unchanged detection logic)
+        if (runDetectionLoop.busy) {
+            animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+            return;
+        }
+        runDetectionLoop.busy = true;
+        if (model && videoRef.current && videoRef.current.readyState >= 2) {
+            if (videoRef.current.videoWidth > 0 && videoRef.current.videoHeight > 0) {
+                try {
+                    const predictions = await model.detect(videoRef.current, 8, 0.6);
+                    let filtered = predictions.filter(p => p.bbox[2] > 20 && p.bbox[3] > 20 && p.score > 0.6);
+                    filtered = filtered.sort((a, b) => b.score - a.score).slice(0, 8);
+                    processDetections(filtered);
+                } catch (err) {
+                    console.error("Error in detection loop:", err);
+                }
+            }
+        }
+        runDetectionLoop.busy = false;
+        animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+    }, [model, processDetections]);
+    // Flag for skipping busy frames
+    runDetectionLoop.busy = false;
+    // --- Canvas Drawing Effect ---
+    useEffect(() => {
+        if (!canvasRef.current || !videoRef.current) return;
+        const ctx = canvasRef.current.getContext('2d');
+        if (!ctx) return;
+        const { videoWidth, videoHeight } = videoRef.current;
+        if (videoWidth === 0 || videoHeight === 0) return;
+        canvasRef.current.width = videoWidth;
+        canvasRef.current.height = videoHeight;
+        ctx.clearRect(0, 0, videoWidth, videoHeight);
+        renderableDetections.forEach(obj => {
+            const bbox = obj.bbox;
+            const flippedX = cameraFacingMode === 'user' ? (videoWidth - bbox[0] - bbox[2]) : bbox[0];
+            ctx.save();
+            ctx.strokeStyle = obj.currentDistance <= 2 ? '#ff0000' : '#00ff00';
+            ctx.lineWidth = 5;
+            ctx.globalAlpha = 1.0;
+            ctx.strokeRect(flippedX, bbox[1], bbox[2], bbox[3]);
+            // Draw label background
+            ctx.fillStyle = 'rgba(0,0,0,0.8)';
+            ctx.fillRect(flippedX, bbox[1] - 28, bbox[2], 28);
+            // Draw label text
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 20px sans-serif';
+            ctx.textBaseline = 'top';
+            ctx.fillText(`${obj.class} (${obj.currentDistance.toFixed(1)}m)`, flippedX + 6, bbox[1] - 26);
+            ctx.restore();
+        });
+    }, [renderableDetections, cameraFacingMode]);
+
+    const stopEverything = useCallback(() => {
+        if (animationLoopRef.current) {
+            cancelAnimationFrame(animationLoopRef.current);
+            animationLoopRef.current = undefined; // Explicitly clear the ref
+        }
+        if (videoRef.current && videoRef.current.srcObject) {
+            (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
+            videoRef.current.srcObject = null;
+        }
+        sceneMemory.current.clear();
+        setRenderableDetections([]);
+        if (canvasRef.current) {
+            const ctx = canvasRef.current.getContext('2d');
+            ctx?.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+        }
+    // AudioFeedback.stop(); // Removed, not implemented
+        console.log("Scanner stopped. Everything reset.");
+    }, []);
+
+    const toggleScanning = useCallback(() => {
+        if (appState === AppState.SCANNING) {
+            setAppState(AppState.READY);
+            AudioFeedback.speak('Scanner stopped.');
+            addMessage('Scanner stopped.', 'bot');
+            stopEverything();
+        } else if (appState === AppState.READY) {
+            // Request camera permission before accessing camera
+            checkAndRequestCameraPermission().then(granted => {
+                if (!granted) {
+                    addMessage('Error: Camera permission denied. Please grant permission in settings.', 'alert');
+                    AudioFeedback.speak('I could not access the camera. Please ensure permissions are granted.');
+                    setAppState(AppState.READY);
+                    return;
+                }
+                setAppState(AppState.SCANNING);
+                AudioFeedback.speak('Scanner starting. Activating camera.');
+                addMessage('Scanner starting...', 'bot');
+
+                const supported = navigator.mediaDevices.getSupportedConstraints();
+                const videoConstraints = {
+                    facingMode: cameraFacingMode,
+                    width: supported.width ? { ideal: 1920, max: 1920 } : undefined,
+                    height: supported.height ? { ideal: 1080, max: 1080 } : undefined,
+                    frameRate: supported.frameRate ? { ideal: 30, max: 30 } : undefined,
+                    aspectRatio: supported.aspectRatio ? 16/9 : undefined
+                };
+                navigator.mediaDevices.getUserMedia({ video: videoConstraints })
+                .then(stream => {
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = stream;
+                        videoRef.current.onloadedmetadata = () => {
+                            videoRef.current?.play().catch(e => console.warn("Video play error:", e));
+                            const track = stream.getVideoTracks()[0];
+                            const settings = track.getSettings();
+                            let cameraMessage = `Using ${settings.facingMode === 'user' ? 'front' : 'rear'} camera.`;
+                            addMessage(cameraMessage, 'bot');
+                            AudioFeedback.speak(cameraMessage);
+                            animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+                        };
+                    }
+                })
+                .catch(err => {
+                    console.warn("Camera constraints not supported, falling back.", err);
+                    navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: cameraFacingMode }
+                    }).then(stream => {
+                        if (videoRef.current) {
+                            videoRef.current.srcObject = stream;
+                            videoRef.current.onloadedmetadata = () => {
+                                videoRef.current?.play().catch(e => console.warn("Video play error:", e));
+                                const track = stream.getVideoTracks()[0];
+                                const settings = track.getSettings();
+                                let cameraMessage = `Using ${settings.facingMode === 'user' ? 'front' : 'rear'} camera.`;
+                                addMessage(cameraMessage, 'bot');
+                                AudioFeedback.speak(cameraMessage);
+                                animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+                            };
+                        }
+                    });
+                });
+            });
+        }
+    }, [appState, addMessage, stopEverything, runDetectionLoop]);
+
+    // --- Voice Command Logic ---
+    // Custom handler for directional voice queries
+    function handleVoiceDirectionQuery(command: string) {
+        command = command.toLowerCase();
+        const videoWidth = videoRef.current ? videoRef.current.videoWidth : 1;
+        // Run detection on the current video frame before responding
+        if (model && videoRef.current && videoRef.current.readyState >= 2) {
+            model.detect(videoRef.current, 8, 0.7).then(predictions => {
+                // Increase score threshold and minimum box size for higher accuracy
+                let filtered = predictions.filter(p => p.bbox[2] > 40 && p.bbox[3] > 40 && p.score > 0.7);
+                filtered = filtered.sort((a, b) => b.score - a.score).slice(0, 8);
+                // Update sceneMemory for consistency
+                processDetections(filtered);
+                const allObjects = Array.from(sceneMemory.current.values()).map(o => o as TrackedObject);
+                let response = "I don't see anything in that direction.";
+                let filteredObjs: TrackedObject[] = [];
+                // Custom keyword arrays
+                const leftKeywords = ["left", "left side"];
+                const rightKeywords = ["right", "right side"];
+                const straightKeywords = ["infront", "ahead", "straight"];
+
+                if (rightKeywords.some(k => command.includes(k))) {
+                    filteredObjs = allObjects.filter(o => getCenter(o.bbox).x < videoWidth / 3)
+                        .sort((a, b) => a.currentDistance - b.currentDistance).slice(0, 2);
+                } else if (leftKeywords.some(k => command.includes(k))) {
+                    filteredObjs = allObjects.filter(o => getCenter(o.bbox).x > videoWidth * (2/3))
+                        .sort((a, b) => a.currentDistance - b.currentDistance).slice(0, 2);
+                } else if (straightKeywords.some(k => command.includes(k))) {
+                    filteredObjs = allObjects.filter(o => getCenter(o.bbox).x > videoWidth / 3 && getCenter(o.bbox).x < videoWidth * (2/3))
+                        .sort((a, b) => a.currentDistance - b.currentDistance).slice(0, 2);
+                }
+                if (filteredObjs.length > 0) {
+                    response = filteredObjs.map(obj => `A ${obj.class} is ${obj.currentDistance.toFixed(1)} meter away from you.`).join(' ');
+                }
+                addMessage(`EchoVision: ${response}`, 'bot');
+                AudioFeedback.speak(response);
+            });
+        } else {
+            // Fallback: use last known objects
+            const allObjects = Array.from(sceneMemory.current.values()).map(o => o as TrackedObject);
+            let response = "I don't see anything in that direction.";
+            let filteredObjs: TrackedObject[] = [];
+            const leftKeywords = ["left", "left side"];
+            const rightKeywords = ["right", "right side"];
+            const straightKeywords = ["infront", "ahead", "straight"];
+            if (rightKeywords.some(k => command.includes(k))) {
+                filteredObjs = allObjects.filter(o => getCenter(o.bbox).x < videoWidth / 3)
+                    .sort((a, b) => a.currentDistance - b.currentDistance).slice(0, 2);
+            } else if (leftKeywords.some(k => command.includes(k))) {
+                filteredObjs = allObjects.filter(o => getCenter(o.bbox).x > videoWidth * (2/3))
+                    .sort((a, b) => a.currentDistance - b.currentDistance).slice(0, 2);
+            } else if (straightKeywords.some(k => command.includes(k))) {
+                filteredObjs = allObjects.filter(o => getCenter(o.bbox).x > videoWidth / 3 && getCenter(o.bbox).x < videoWidth * (2/3))
+                    .sort((a, b) => a.currentDistance - b.currentDistance).slice(0, 2);
+            }
+            if (filteredObjs.length > 0) {
+                response = filteredObjs.map(obj => `A ${obj.class} is ${obj.currentDistance.toFixed(1)} meter away from you.`).join(' ');
+            }
+            addMessage(`EchoVision: ${response}`, 'bot');
+            AudioFeedback.speak(response);
+        }
+    }
+    // Detect platform and set up recognition
+    const isNativePlatform = () => !!(window.Capacitor && window.Capacitor.isNativePlatform);
+    const recognition = useMemo(() => {
+        if (isNativePlatform()) {
+            // Native: handled via plugin
+            return null;
+        } else {
+            const SpeechRecognitionWeb = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognitionWeb) return null;
+            const instance = new SpeechRecognitionWeb();
+            instance.continuous = false;
+            instance.lang = 'en-US';
+            instance.interimResults = false;
+            return instance;
+        }
+    }, []);
+
+    const processVoiceCommand = useCallback((command: string) => {
+        command = command.toLowerCase();
+        let response = "I'm not sure how to answer that.";
+        const videoWidth = videoRef.current ? videoRef.current.videoWidth : 1;
+        const allObjects = Array.from(sceneMemory.current.values()).map(o => o as TrackedObject);
+
+        function formatObjectList(objs: TrackedObject[]) {
+            if (objs.length === 0) return null;
+            return objs.map(o => `${o.class} [${o.currentDistance.toFixed(1)}m away]`).join(', ');
+        }
+
+        if (allObjects.length === 0) {
+            response = "I don't see anything right now.";
+        } else if (command.includes('what') && (command.includes('see') || command.includes('front') || command.includes('around'))) {
+            // In front: center third of the frame
+            const frontObjects = allObjects.filter(o => {
+                const x = getCenter(o.bbox).x;
+                return x > videoWidth / 3 && x < videoWidth * (2/3);
+            });
+            const formatted = formatObjectList(frontObjects);
+            response = formatted ? `In front of you: ${formatted}.` : "I don't see anything in front of you.";
+        } else if (command.includes('right')) {
+            // User's "right" is the left side of the raw video frame due to mirroring
+            const rightObjects = allObjects.filter(o => getCenter(o.bbox).x < videoWidth / 3);
+            const formatted = formatObjectList(rightObjects);
+            response = formatted ? `On your right: ${formatted}.` : "I don't see anything on your right.";
+        } else if (command.includes('left')) {
+            // User's "left" is the right side of the raw video frame
+            const leftObjects = allObjects.filter(o => getCenter(o.bbox).x > videoWidth * (2/3));
+            const formatted = formatObjectList(leftObjects);
+            response = formatted ? `On your left: ${formatted}.` : "I don't see anything on your left.";
+        }
+        addMessage(`You: "${command}"`, 'user');
+        addMessage(`EchoVision: ${response}`, 'bot');
+        AudioFeedback.speak(response);
+    }, [addMessage]);
+
+    const handleListen = useCallback(() => {
+        // Cancel any ongoing audio feedback before starting voice query
+        if ('speechSynthesis' in window && window.speechSynthesis) {
+            window.speechSynthesis.cancel();
+        }
+        // Pause detection and audio feedback
+        setPausedForVoiceQuery(true);
+        if (animationLoopRef.current) {
+            cancelAnimationFrame(animationLoopRef.current);
+            animationLoopRef.current = undefined;
+        }
+        setIsListening(true);
+        addMessage("Listening for your question...", 'bot');
+        AudioFeedback.speak("Listening.");
+
+        if (isNativePlatform()) {
+            // Native Android/iOS: use Capacitor plugin
+            SpeechRecognition.requestPermissions().then(() => {
+                SpeechRecognition.start({
+                    language: 'en-US',
+                    maxResults: 1,
+                    prompt: 'Speak now',
+                    partialResults: true
+                }).then(() => {
+                    // Listen for partialResults event
+                    SpeechRecognition.addListener('partialResults', (data: any) => {
+                        const transcript = data.matches && data.matches[0] ? data.matches[0] : '';
+                        addMessage(`You: "${transcript || '[Unrecognized or empty input]'}"`, 'user');
+                        // Resume detection and process after input
+                        setPausedForVoiceQuery(false);
+                        setTimeout(() => {
+                            handleVoiceDirectionQuery(transcript);
+                        }, 100); // slight delay to ensure detection resumes
+                    });
+                }).catch((err: any) => {
+                    addMessage("Sorry, I couldn't hear you.", 'bot');
+                    AudioFeedback.speak("Sorry, I couldn't hear you.");
+                    setIsListening(false);
+                    setPausedForVoiceQuery(false);
+                    if (appStateRef.current === AppState.SCANNING) {
+                        animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+                    }
+                });
+                // Stop listening after 4 seconds
+                setTimeout(() => {
+                    SpeechRecognition.stop();
+                    setIsListening(false);
+                    setPausedForVoiceQuery(false);
+                    if (appStateRef.current === AppState.SCANNING) {
+                        animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+                    }
+                }, 6000);
+            }).catch(() => {
+                addMessage("Microphone access denied. Please enable microphone permission.", 'alert');
+                AudioFeedback.speak("Microphone access denied. Please enable microphone permission.");
+                setPausedForVoiceQuery(false);
+                setIsListening(false);
+                if (appStateRef.current === AppState.SCANNING) {
+                    animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+                }
+            });
+        } else {
+            // Browser: use Web Speech API
+            if (!recognition) {
+                addMessage("Speech recognition is not supported in this browser.", 'alert');
+                AudioFeedback.speak("Speech recognition not supported.");
+                setPausedForVoiceQuery(false);
+                setIsListening(false);
+                if (appStateRef.current === AppState.SCANNING) {
+                    animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+                }
+                return;
+            }
+            if (isListening) {
+                recognition.stop();
+                return;
+            }
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(() => {
+                    recognition.start();
+                    let listenTimeout = setTimeout(() => {
+                        recognition.stop();
+                    }, 6000); // 6 seconds max listening
+                    recognition.onresult = (event: any) => {
+                        clearTimeout(listenTimeout);
+                        const transcript = event.results[0][0].transcript;
+                        addMessage(`You: "${transcript || '[Unrecognized or empty input]'}"`, 'user');
+                        // Resume detection and process after input
+                        setPausedForVoiceQuery(false);
+                        setTimeout(() => {
+                            handleVoiceDirectionQuery(transcript);
+                        }, 100);
+                    };
+                    recognition.onend = () => {
+                        setIsListening(false);
+                        setPausedForVoiceQuery(false);
+                        if (appStateRef.current === AppState.SCANNING) {
+                            animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+                        }
+                    };
+                    recognition.onerror = (event: any) => {
+                        clearTimeout(listenTimeout);
+                        console.error("Speech recognition error:", event.error);
+                        addMessage(`You: "[Unrecognized or error: ${event.error}]"`, 'user');
+                        addMessage("Sorry, I couldn't hear you.", 'bot');
+                        AudioFeedback.speak("Sorry, I couldn't hear you.");
+                        setIsListening(false);
+                        setPausedForVoiceQuery(false);
+                        // Resume detection after error
+                        if (appStateRef.current === AppState.SCANNING) {
+                            animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+                        }
+                    };
+                })
+                .catch(() => {
+                    addMessage("Microphone access denied. Please enable microphone permission.", 'alert');
+                    AudioFeedback.speak("Microphone access denied. Please enable microphone permission.");
+                    setPausedForVoiceQuery(false);
+                    setIsListening(false);
+                    if (appStateRef.current === AppState.SCANNING) {
+                        animationLoopRef.current = requestAnimationFrame(runDetectionLoop);
+                    }
+                });
+        }
+    }, [recognition, isListening, addMessage, runDetectionLoop]);
+    // --- Render Logic ---
+    const renderButtonText = () => {
+        switch(appState) {
+            case AppState.LOADING_MODEL: return `LOADING ${loadingProgress}%`;
+            case AppState.READY: return 'START';
+            case AppState.SCANNING: return 'STOP';
+            case AppState.ERROR: return 'ERROR';
+            default: return '...';
+        }
+    };
+    const isButtonDisabled = appState === AppState.LOADING_MODEL || appState === AppState.ERROR;
+    
+    return (
+    <div className="relative w-full h-full flex flex-col overflow-hidden bg-black"> 
+            {/* <Header /> */} // Removed, not defined
+            {cameraPermission === 'denied' ? (
+                <div className="flex flex-col items-center justify-center h-full text-center text-red-500 bg-black">
+                    <h2 className="text-xl font-bold mb-4">Camera Permission Denied</h2>
+                    <p className="mb-2">Please enable camera permission in your device settings to use this app.</p>
+                    <p className="text-sm text-gray-400">Go to Settings &gt; Apps &gt; echovision---interactive-scene-navigator &gt; Permissions</p>
+                </div>
+            ) : (
+                <>
+                <div className="relative flex-grow w-full h-full">
+                    <div className="absolute inset-0 flex items-center justify-center bg-black">
+                        <video
+                            ref={videoRef}
+                            playsInline
+                            muted
+                            className={`w-full h-full object-cover ${cameraFacingMode === 'user' ? 'transform -scale-x-100' : ''}`}
+                        ></video>
+                        <canvas ref={canvasRef} className="absolute top-0 left-0 w-full h-full pointer-events-none"></canvas>
+                    </div>
+                </div>
+
+                <div className="absolute bottom-0 left-0 right-0 p-4 pt-0 flex flex-col w-full h-2/5 justify-end z-30 bg-gradient-to-t from-black via-black/80 to-transparent">
+                    <div ref={chatLogRef} className="flex-grow w-full bg-black rounded-lg p-3 overflow-y-auto flex flex-col chat-log mb-4">
+                        {messageHistory.length === 0 ? (
+                            <div className="text-center text-gray-400 m-auto">Messages and alerts will appear here.</div>
+                        ) : (
+                            messageHistory.map(msg => <MessageComponent key={msg.id} msg={msg} />)
+                        )}
+                    </div>
+
+                    <div className="flex items-center justify-center space-x-6">
+                        <button onClick={handleListen} disabled={appState !== AppState.SCANNING} className={`w-16 h-16 rounded-full flex justify-center items-center transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed ${isListening ? 'bg-green-600 border-green-400 mic-active' : 'bg-gray-700 border-gray-500'}`}>
+                            <svg className="w-8 h-8 text-white" fill="currentColor" viewBox="0 0 20 20">
+                                <path d="M7 4a3 3 0 016 0v6a3 3 0 11-6 0V4z"></path><path d="M5.5 10.5a.5.5 0 01.5.5v1a4 4 0 004 4h.5a.5.5 0 010 1h-.5a5 5 0 01-5-5v-1a.5.5 0 01.5-.5z"></path><path d="M10 18a5 5 0 004.545-2.862a.5.5 0 01.91.4A6 6 0 0110 19a6 6 0 01-5.455-3.262a.5.5 0 11.91-.4A5 5 0 0010 18z"></path>
+                            </svg>
+                        </button>
+                        <button onClick={toggleScanning} disabled={isButtonDisabled} className={`w-24 h-24 rounded-full text-white font-bold text-lg flex justify-center items-center transform transition-all duration-300 ${appState === AppState.READY ? 'bg-blue-600 hover:bg-blue-700 active:scale-95 scan-button-shadow' : appState === AppState.SCANNING ? 'bg-red-600 hover:bg-red-700 active:scale-95 scan-button-shadow' : 'bg-gray-500 cursor-not-allowed'}`}>
+                            {renderButtonText()}
+                        </button>
+                        <button
+                            onClick={switchCamera}
+                            className="bg-gray-900 rounded-full p-2 shadow-lg flex items-center justify-center hover:bg-gray-700 transition-all"
+                            style={{ width: 56, height: 56 }}
+                            aria-label="Switch Camera"
+                        >
+                            <CameraSwitchIcon />
+                        </button>
+                    </div>
+                </div>
+                </>
+            )}
+        </div>
+    );
+};
+
+export default App;
+
